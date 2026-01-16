@@ -1,0 +1,14 @@
+# Copyright (c) 2026 左岚. All rights reserved.
+services:
+  - type: web
+    name: cli-proxy-api
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /management.html
+    envVars:
+      - key: PORT
+        value: 8317
+      - key: TZ
+        value: Asia/Shanghai

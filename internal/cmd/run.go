@@ -6,6 +6,8 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -25,6 +27,17 @@ import (
 //   - configPath: The path to the configuration file
 //   - localPassword: Optional password accepted for local management requests
 func StartService(cfg *config.Config, configPath string, localPassword string) {
+	// Check PORT environment variable (common in Cloud platforms like Render/Heroku) # 检查云平台端口环境变量
+	if portStr := os.Getenv("PORT"); portStr != "" {
+		if cfg != nil {
+			var port int
+			if _, err := fmt.Sscanf(portStr, "%d", &port); err == nil && port > 0 {
+				cfg.Port = port
+				log.Infof("Overriding configured port with PORT environment variable: %d", port)
+			}
+		}
+	}
+
 	builder := cliproxy.NewBuilder().
 		WithConfig(cfg).
 		WithConfigPath(configPath).
