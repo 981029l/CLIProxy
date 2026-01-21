@@ -5,7 +5,8 @@ services:
       - "8317:8317"
       - "80:8317" # Map container port 8317 to host port 80 for domain access
     volumes:
-      - ./config:/app/config
+      - ./config:/CLIProxyAPI/config
+    command: ./CLIProxyAPI -config config/config.yaml
     restart: always
     environment:
       - PORT=8317
