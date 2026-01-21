@@ -76,8 +76,25 @@ if [ -f "docker-compose.yml" ] || [ -f "compose.yaml" ]; then
     # Create empty config if not exists
     if [ ! -f "config/config.yaml" ]; then
         echo -e "${BLUE}Creating default config/config.yaml...${NC}"
+        mkdir -p config
         cp config/config.example.yaml config/config.yaml 2>/dev/null || touch config/config.yaml
     fi
+
+    # Configure Upstream Remote for Updates
+    echo -e "${GREEN}[3.5/5] Configuring official update source...${NC}"
+    git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git 2>/dev/null || git remote set-url upstream https://github.com/router-for-me/CLIProxyAPI.git
+    git fetch upstream
+
+    # Create simplified update script
+    cat > update.sh << 'EOF'
+#!/bin/bash
+echo "Pulling latest code from official repository..."
+git pull upstream main
+echo "Rebuilding and restarting service..."
+sudo docker compose up -d --build
+echo "Update complete!"
+EOF
+    chmod +x update.sh
     
     # Run with Docker Compose
     sudo docker compose up -d --build
