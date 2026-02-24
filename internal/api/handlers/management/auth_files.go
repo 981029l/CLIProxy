@@ -3,13 +3,14 @@ package management
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,10 +20,12 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
 	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -228,14 +231,6 @@ func stopForwarderInstance(port int, forwarder *callbackForwarder) {
 	}
 
 	log.Infof("callback forwarder on port %d stopped", port)
-}
-
-func sanitizeAntigravityFileName(email string) string {
-	if strings.TrimSpace(email) == "" {
-		return "antigravity.json"
-	}
-	replacer := strings.NewReplacer("@", "_", ".", "_")
-	return fmt.Sprintf("antigravity-%s.json", replacer.Replace(email))
 }
 
 func (h *Handler) managementCallbackURL(path string) (string, error) {
@@ -747,6 +742,153 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	return err
 }
 
+// PatchAuthFileStatus toggles the disabled state of an auth file
+func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name     string `json:"name"`
+		Disabled *bool  `json:"disabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	if req.Disabled == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "disabled is required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Find auth by name or ID
+	var targetAuth *coreauth.Auth
+	if auth, ok := h.authManager.GetByID(name); ok {
+		targetAuth = auth
+	} else {
+		auths := h.authManager.List()
+		for _, auth := range auths {
+			if auth.FileName == name {
+				targetAuth = auth
+				break
+			}
+		}
+	}
+
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	// Update disabled state
+	targetAuth.Disabled = *req.Disabled
+	if *req.Disabled {
+		targetAuth.Status = coreauth.StatusDisabled
+		targetAuth.StatusMessage = "disabled via management API"
+	} else {
+		targetAuth.Status = coreauth.StatusActive
+		targetAuth.StatusMessage = ""
+	}
+	targetAuth.UpdatedAt = time.Now()
+
+	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+}
+
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority) of an auth file.
+func (h *Handler) PatchAuthFileFields(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name     string  `json:"name"`
+		Prefix   *string `json:"prefix"`
+		ProxyURL *string `json:"proxy_url"`
+		Priority *int    `json:"priority"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Find auth by name or ID
+	var targetAuth *coreauth.Auth
+	if auth, ok := h.authManager.GetByID(name); ok {
+		targetAuth = auth
+	} else {
+		auths := h.authManager.List()
+		for _, auth := range auths {
+			if auth.FileName == name {
+				targetAuth = auth
+				break
+			}
+		}
+	}
+
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	changed := false
+	if req.Prefix != nil {
+		targetAuth.Prefix = *req.Prefix
+		changed = true
+	}
+	if req.ProxyURL != nil {
+		targetAuth.ProxyURL = *req.ProxyURL
+		changed = true
+	}
+	if req.Priority != nil {
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if *req.Priority == 0 {
+			delete(targetAuth.Metadata, "priority")
+		} else {
+			targetAuth.Metadata["priority"] = *req.Priority
+		}
+		changed = true
+	}
+
+	if !changed {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
+		return
+	}
+
+	targetAuth.UpdatedAt = time.Now()
+
+	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 func (h *Handler) disableAuth(ctx context.Context, id string) {
 	if h == nil || h.authManager == nil {
 		return
@@ -913,66 +1055,13 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		rawCode := resultMap["code"]
 		code := strings.Split(rawCode, "#")[0]
 
-		// Exchange code for tokens (replicate logic using updated redirect_uri)
-		// Extract client_id from the modified auth URL
-		clientID := ""
-		if u2, errP := url.Parse(authURL); errP == nil {
-			clientID = u2.Query().Get("client_id")
-		}
-		// Build request
-		bodyMap := map[string]any{
-			"code":          code,
-			"state":         state,
-			"grant_type":    "authorization_code",
-			"client_id":     clientID,
-			"redirect_uri":  "http://localhost:54545/callback",
-			"code_verifier": pkceCodes.CodeVerifier,
-		}
-		bodyJSON, _ := json.Marshal(bodyMap)
-
-		httpClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
-		req, _ := http.NewRequestWithContext(ctx, "POST", "https://console.anthropic.com/v1/oauth/token", strings.NewReader(string(bodyJSON)))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json")
-		resp, errDo := httpClient.Do(req)
-		if errDo != nil {
-			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errDo)
+		// Exchange code for tokens using internal auth service
+		bundle, errExchange := anthropicAuth.ExchangeCodeForTokens(ctx, code, state, pkceCodes)
+		if errExchange != nil {
+			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errExchange)
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
 			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
 			return
-		}
-		defer func() {
-			if errClose := resp.Body.Close(); errClose != nil {
-				log.Errorf("failed to close response body: %v", errClose)
-			}
-		}()
-		respBody, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != http.StatusOK {
-			log.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(respBody))
-			SetOAuthSessionError(state, fmt.Sprintf("token exchange failed with status %d", resp.StatusCode))
-			return
-		}
-		var tResp struct {
-			AccessToken  string `json:"access_token"`
-			RefreshToken string `json:"refresh_token"`
-			ExpiresIn    int    `json:"expires_in"`
-			Account      struct {
-				EmailAddress string `json:"email_address"`
-			} `json:"account"`
-		}
-		if errU := json.Unmarshal(respBody, &tResp); errU != nil {
-			log.Errorf("failed to parse token response: %v", errU)
-			SetOAuthSessionError(state, "Failed to parse token response")
-			return
-		}
-		bundle := &claude.ClaudeAuthBundle{
-			TokenData: claude.ClaudeTokenData{
-				AccessToken:  tResp.AccessToken,
-				RefreshToken: tResp.RefreshToken,
-				Email:        tResp.Account.EmailAddress,
-				Expire:       time.Now().Add(time.Duration(tResp.ExpiresIn) * time.Second).Format(time.RFC3339),
-			},
-			LastRefresh: time.Now().Format(time.RFC3339),
 		}
 
 		// Create token storage
@@ -1013,17 +1102,13 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 
 	fmt.Println("Initializing Google authentication...")
 
-	// OAuth2 configuration (mirrors internal/auth/gemini)
+	// OAuth2 configuration using exported constants from internal/auth/gemini
 	conf := &oauth2.Config{
-		ClientID:     "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
-		ClientSecret: "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",
-		RedirectURL:  "http://localhost:8085/oauth2callback",
-		Scopes: []string{
-			"https://www.googleapis.com/auth/cloud-platform",
-			"https://www.googleapis.com/auth/userinfo.email",
-			"https://www.googleapis.com/auth/userinfo.profile",
-		},
-		Endpoint: google.Endpoint,
+		ClientID:     geminiAuth.ClientID,
+		ClientSecret: geminiAuth.ClientSecret,
+		RedirectURL:  fmt.Sprintf("http://localhost:%d/oauth2callback", geminiAuth.DefaultCallbackPort),
+		Scopes:       geminiAuth.Scopes,
+		Endpoint:     google.Endpoint,
 	}
 
 	// Build authorization URL and return it immediately
@@ -1145,13 +1230,9 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		}
 
 		ifToken["token_uri"] = "https://oauth2.googleapis.com/token"
-		ifToken["client_id"] = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
-		ifToken["client_secret"] = "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"
-		ifToken["scopes"] = []string{
-			"https://www.googleapis.com/auth/cloud-platform",
-			"https://www.googleapis.com/auth/userinfo.email",
-			"https://www.googleapis.com/auth/userinfo.profile",
-		}
+		ifToken["client_id"] = geminiAuth.ClientID
+		ifToken["client_secret"] = geminiAuth.ClientSecret
+		ifToken["scopes"] = geminiAuth.Scopes
 		ifToken["universe_domain"] = "googleapis.com"
 
 		ts := geminiAuth.GeminiTokenStorage{
@@ -1188,6 +1269,30 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			}
 			ts.ProjectID = strings.Join(projects, ",")
 			ts.Checked = true
+		} else if strings.EqualFold(requestedProjectID, "GOOGLE_ONE") {
+			ts.Auto = false
+			if errSetup := performGeminiCLISetup(ctx, gemClient, &ts, ""); errSetup != nil {
+				log.Errorf("Google One auto-discovery failed: %v", errSetup)
+				SetOAuthSessionError(state, "Google One auto-discovery failed")
+				return
+			}
+			if strings.TrimSpace(ts.ProjectID) == "" {
+				log.Error("Google One auto-discovery returned empty project ID")
+				SetOAuthSessionError(state, "Google One auto-discovery returned empty project ID")
+				return
+			}
+			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
+			if errCheck != nil {
+				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
+				SetOAuthSessionError(state, "Failed to verify Cloud AI API status")
+				return
+			}
+			ts.Checked = isChecked
+			if !isChecked {
+				log.Error("Cloud AI API is not enabled for the auto-discovered project")
+				SetOAuthSessionError(state, "Cloud AI API not enabled")
+				return
+			}
 		} else {
 			if errEnsure := ensureGeminiProjectAndOnboard(ctx, gemClient, &ts, requestedProjectID); errEnsure != nil {
 				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errEnsure)
@@ -1338,74 +1443,34 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 
 		log.Debug("Authorization code received, exchanging for tokens...")
-		// Extract client_id from authURL
-		clientID := ""
-		if u2, errP := url.Parse(authURL); errP == nil {
-			clientID = u2.Query().Get("client_id")
-		}
-		// Exchange code for tokens with redirect equal to mgmtRedirect
-		form := url.Values{
-			"grant_type":    {"authorization_code"},
-			"client_id":     {clientID},
-			"code":          {code},
-			"redirect_uri":  {"http://localhost:1455/auth/callback"},
-			"code_verifier": {pkceCodes.CodeVerifier},
-		}
-		httpClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
-		req, _ := http.NewRequestWithContext(ctx, "POST", "https://auth.openai.com/oauth/token", strings.NewReader(form.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Set("Accept", "application/json")
-		resp, errDo := httpClient.Do(req)
-		if errDo != nil {
-			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errDo)
+		// Exchange code for tokens using internal auth service
+		bundle, errExchange := openaiAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
+		if errExchange != nil {
+			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
 			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
 			return
 		}
-		defer func() { _ = resp.Body.Close() }()
-		respBody, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != http.StatusOK {
-			SetOAuthSessionError(state, fmt.Sprintf("Token exchange failed with status %d", resp.StatusCode))
-			log.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(respBody))
-			return
-		}
-		var tokenResp struct {
-			AccessToken  string `json:"access_token"`
-			RefreshToken string `json:"refresh_token"`
-			IDToken      string `json:"id_token"`
-			ExpiresIn    int    `json:"expires_in"`
-		}
-		if errU := json.Unmarshal(respBody, &tokenResp); errU != nil {
-			SetOAuthSessionError(state, "Failed to parse token response")
-			log.Errorf("failed to parse token response: %v", errU)
-			return
-		}
-		claims, _ := codex.ParseJWTToken(tokenResp.IDToken)
-		email := ""
-		accountID := ""
+
+		// Extract additional info for filename generation
+		claims, _ := codex.ParseJWTToken(bundle.TokenData.IDToken)
+		planType := ""
+		hashAccountID := ""
 		if claims != nil {
-			email = claims.GetUserEmail()
-			accountID = claims.GetAccountID()
-		}
-		// Build bundle compatible with existing storage
-		bundle := &codex.CodexAuthBundle{
-			TokenData: codex.CodexTokenData{
-				IDToken:      tokenResp.IDToken,
-				AccessToken:  tokenResp.AccessToken,
-				RefreshToken: tokenResp.RefreshToken,
-				AccountID:    accountID,
-				Email:        email,
-				Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
-			},
-			LastRefresh: time.Now().Format(time.RFC3339),
+			planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+			if accountID := claims.GetAccountID(); accountID != "" {
+				digest := sha256.Sum256([]byte(accountID))
+				hashAccountID = hex.EncodeToString(digest[:])[:8]
+			}
 		}
 
 		// Create token storage and persist
 		tokenStorage := openaiAuth.CreateTokenStorage(bundle)
+		fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
 		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("codex-%s.json", tokenStorage.Email),
+			ID:       fileName,
 			Provider: "codex",
-			FileName: fmt.Sprintf("codex-%s.json", tokenStorage.Email),
+			FileName: fileName,
 			Storage:  tokenStorage,
 			Metadata: map[string]any{
 				"email":      tokenStorage.Email,
@@ -1431,22 +1496,11 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 }
 
 func (h *Handler) RequestAntigravityToken(c *gin.Context) {
-	const (
-		antigravityCallbackPort = 51121
-		antigravityClientID     = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-		antigravityClientSecret = "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"
-	)
-	var antigravityScopes = []string{
-		"https://www.googleapis.com/auth/cloud-platform",
-		"https://www.googleapis.com/auth/userinfo.email",
-		"https://www.googleapis.com/auth/userinfo.profile",
-		"https://www.googleapis.com/auth/cclog",
-		"https://www.googleapis.com/auth/experimentsandconfigs",
-	}
-
 	ctx := context.Background()
 
 	fmt.Println("Initializing Antigravity authentication...")
+
+	authSvc := antigravity.NewAntigravityAuth(h.cfg, nil)
 
 	state, errState := misc.GenerateRandomState()
 	if errState != nil {
@@ -1455,17 +1509,8 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		return
 	}
 
-	redirectURI := fmt.Sprintf("http://localhost:%d/oauth-callback", antigravityCallbackPort)
-
-	params := url.Values{}
-	params.Set("access_type", "offline")
-	params.Set("client_id", antigravityClientID)
-	params.Set("prompt", "consent")
-	params.Set("redirect_uri", redirectURI)
-	params.Set("response_type", "code")
-	params.Set("scope", strings.Join(antigravityScopes, " "))
-	params.Set("state", state)
-	authURL := "https://accounts.google.com/o/oauth2/v2/auth?" + params.Encode()
+	redirectURI := fmt.Sprintf("http://localhost:%d/oauth-callback", antigravity.CallbackPort)
+	authURL := authSvc.BuildAuthURL(state, redirectURI)
 
 	RegisterOAuthSession(state, "antigravity")
 
@@ -1479,7 +1524,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			return
 		}
 		var errStart error
-		if forwarder, errStart = startCallbackForwarder(antigravityCallbackPort, "antigravity", targetURL); errStart != nil {
+		if forwarder, errStart = startCallbackForwarder(antigravity.CallbackPort, "antigravity", targetURL); errStart != nil {
 			log.WithError(errStart).Error("failed to start antigravity callback forwarder")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
 			return
@@ -1488,7 +1533,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 
 	go func() {
 		if isWebUI {
-			defer stopCallbackForwarderInstance(antigravityCallbackPort, forwarder)
+			defer stopCallbackForwarderInstance(antigravity.CallbackPort, forwarder)
 		}
 
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-antigravity-%s.oauth", state))
@@ -1528,93 +1573,36 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			time.Sleep(500 * time.Millisecond)
 		}
 
-		httpClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
-		form := url.Values{}
-		form.Set("code", authCode)
-		form.Set("client_id", antigravityClientID)
-		form.Set("client_secret", antigravityClientSecret)
-		form.Set("redirect_uri", redirectURI)
-		form.Set("grant_type", "authorization_code")
-
-		req, errNewRequest := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
-		if errNewRequest != nil {
-			log.Errorf("Failed to build token request: %v", errNewRequest)
-			SetOAuthSessionError(state, "Failed to build token request")
-			return
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-		resp, errDo := httpClient.Do(req)
-		if errDo != nil {
-			log.Errorf("Failed to execute token request: %v", errDo)
+		tokenResp, errToken := authSvc.ExchangeCodeForTokens(ctx, authCode, redirectURI)
+		if errToken != nil {
+			log.Errorf("Failed to exchange token: %v", errToken)
 			SetOAuthSessionError(state, "Failed to exchange token")
 			return
 		}
-		defer func() {
-			if errClose := resp.Body.Close(); errClose != nil {
-				log.Errorf("antigravity token exchange close error: %v", errClose)
-			}
-		}()
 
-		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			log.Errorf("Antigravity token exchange failed with status %d: %s", resp.StatusCode, string(bodyBytes))
-			SetOAuthSessionError(state, fmt.Sprintf("Token exchange failed: %d", resp.StatusCode))
+		accessToken := strings.TrimSpace(tokenResp.AccessToken)
+		if accessToken == "" {
+			log.Error("antigravity: token exchange returned empty access token")
+			SetOAuthSessionError(state, "Failed to exchange token")
 			return
 		}
 
-		var tokenResp struct {
-			AccessToken  string `json:"access_token"`
-			RefreshToken string `json:"refresh_token"`
-			ExpiresIn    int64  `json:"expires_in"`
-			TokenType    string `json:"token_type"`
-		}
-		if errDecode := json.NewDecoder(resp.Body).Decode(&tokenResp); errDecode != nil {
-			log.Errorf("Failed to parse token response: %v", errDecode)
-			SetOAuthSessionError(state, "Failed to parse token response")
+		email, errInfo := authSvc.FetchUserInfo(ctx, accessToken)
+		if errInfo != nil {
+			log.Errorf("Failed to fetch user info: %v", errInfo)
+			SetOAuthSessionError(state, "Failed to fetch user info")
 			return
 		}
-
-		email := ""
-		if strings.TrimSpace(tokenResp.AccessToken) != "" {
-			infoReq, errInfoReq := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.googleapis.com/oauth2/v1/userinfo?alt=json", nil)
-			if errInfoReq != nil {
-				log.Errorf("Failed to build user info request: %v", errInfoReq)
-				SetOAuthSessionError(state, "Failed to build user info request")
-				return
-			}
-			infoReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
-
-			infoResp, errInfo := httpClient.Do(infoReq)
-			if errInfo != nil {
-				log.Errorf("Failed to execute user info request: %v", errInfo)
-				SetOAuthSessionError(state, "Failed to execute user info request")
-				return
-			}
-			defer func() {
-				if errClose := infoResp.Body.Close(); errClose != nil {
-					log.Errorf("antigravity user info close error: %v", errClose)
-				}
-			}()
-
-			if infoResp.StatusCode >= http.StatusOK && infoResp.StatusCode < http.StatusMultipleChoices {
-				var infoPayload struct {
-					Email string `json:"email"`
-				}
-				if errDecodeInfo := json.NewDecoder(infoResp.Body).Decode(&infoPayload); errDecodeInfo == nil {
-					email = strings.TrimSpace(infoPayload.Email)
-				}
-			} else {
-				bodyBytes, _ := io.ReadAll(infoResp.Body)
-				log.Errorf("User info request failed with status %d: %s", infoResp.StatusCode, string(bodyBytes))
-				SetOAuthSessionError(state, fmt.Sprintf("User info request failed: %d", infoResp.StatusCode))
-				return
-			}
+		email = strings.TrimSpace(email)
+		if email == "" {
+			log.Error("antigravity: user info returned empty email")
+			SetOAuthSessionError(state, "Failed to fetch user info")
+			return
 		}
 
 		projectID := ""
-		if strings.TrimSpace(tokenResp.AccessToken) != "" {
-			fetchedProjectID, errProject := sdkAuth.FetchAntigravityProjectID(ctx, tokenResp.AccessToken, httpClient)
+		if accessToken != "" {
+			fetchedProjectID, errProject := authSvc.FetchProjectID(ctx, accessToken)
 			if errProject != nil {
 				log.Warnf("antigravity: failed to fetch project ID: %v", errProject)
 			} else {
@@ -1639,7 +1627,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			metadata["project_id"] = projectID
 		}
 
-		fileName := sanitizeAntigravityFileName(email)
+		fileName := antigravity.CredentialFileName(email)
 		label := strings.TrimSpace(email)
 		if label == "" {
 			label = "antigravity"
@@ -1721,6 +1709,82 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use Qwen services through this CLI")
 		CompleteOAuthSession(state)
+	}()
+
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func (h *Handler) RequestKimiToken(c *gin.Context) {
+	ctx := context.Background()
+
+	fmt.Println("Initializing Kimi authentication...")
+
+	state := fmt.Sprintf("kmi-%d", time.Now().UnixNano())
+	// Initialize Kimi auth service
+	kimiAuth := kimi.NewKimiAuth(h.cfg)
+
+	// Generate authorization URL
+	deviceFlow, errStartDeviceFlow := kimiAuth.StartDeviceFlow(ctx)
+	if errStartDeviceFlow != nil {
+		log.Errorf("Failed to generate authorization URL: %v", errStartDeviceFlow)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
+		return
+	}
+	authURL := deviceFlow.VerificationURIComplete
+	if authURL == "" {
+		authURL = deviceFlow.VerificationURI
+	}
+
+	RegisterOAuthSession(state, "kimi")
+
+	go func() {
+		fmt.Println("Waiting for authentication...")
+		authBundle, errWaitForAuthorization := kimiAuth.WaitForAuthorization(ctx, deviceFlow)
+		if errWaitForAuthorization != nil {
+			SetOAuthSessionError(state, "Authentication failed")
+			fmt.Printf("Authentication failed: %v\n", errWaitForAuthorization)
+			return
+		}
+
+		// Create token storage
+		tokenStorage := kimiAuth.CreateTokenStorage(authBundle)
+
+		metadata := map[string]any{
+			"type":          "kimi",
+			"access_token":  authBundle.TokenData.AccessToken,
+			"refresh_token": authBundle.TokenData.RefreshToken,
+			"token_type":    authBundle.TokenData.TokenType,
+			"scope":         authBundle.TokenData.Scope,
+			"timestamp":     time.Now().UnixMilli(),
+		}
+		if authBundle.TokenData.ExpiresAt > 0 {
+			expired := time.Unix(authBundle.TokenData.ExpiresAt, 0).UTC().Format(time.RFC3339)
+			metadata["expired"] = expired
+		}
+		if strings.TrimSpace(authBundle.DeviceID) != "" {
+			metadata["device_id"] = strings.TrimSpace(authBundle.DeviceID)
+		}
+
+		fileName := fmt.Sprintf("kimi-%d.json", time.Now().UnixMilli())
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "kimi",
+			FileName: fileName,
+			Label:    "Kimi User",
+			Storage:  tokenStorage,
+			Metadata: metadata,
+		}
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save authentication tokens: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			return
+		}
+
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		fmt.Println("You can now use Kimi services through this CLI")
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("kimi")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -2077,7 +2141,48 @@ func performGeminiCLISetup(ctx context.Context, httpClient *http.Client, storage
 		}
 	}
 	if projectID == "" {
-		return &projectSelectionRequiredError{}
+		// Auto-discovery: try onboardUser without specifying a project
+		// to let Google auto-provision one (matches Gemini CLI headless behavior
+		// and Antigravity's FetchProjectID pattern).
+		autoOnboardReq := map[string]any{
+			"tierId":   tierID,
+			"metadata": metadata,
+		}
+
+		autoCtx, autoCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer autoCancel()
+		for attempt := 1; ; attempt++ {
+			var onboardResp map[string]any
+			if errOnboard := callGeminiCLI(autoCtx, httpClient, "onboardUser", autoOnboardReq, &onboardResp); errOnboard != nil {
+				return fmt.Errorf("auto-discovery onboardUser: %w", errOnboard)
+			}
+
+			if done, okDone := onboardResp["done"].(bool); okDone && done {
+				if resp, okResp := onboardResp["response"].(map[string]any); okResp {
+					switch v := resp["cloudaicompanionProject"].(type) {
+					case string:
+						projectID = strings.TrimSpace(v)
+					case map[string]any:
+						if id, okID := v["id"].(string); okID {
+							projectID = strings.TrimSpace(id)
+						}
+					}
+				}
+				break
+			}
+
+			log.Debugf("Auto-discovery: onboarding in progress, attempt %d...", attempt)
+			select {
+			case <-autoCtx.Done():
+				return &projectSelectionRequiredError{}
+			case <-time.After(2 * time.Second):
+			}
+		}
+
+		if projectID == "" {
+			return &projectSelectionRequiredError{}
+		}
+		log.Infof("Auto-discovered project ID via onboarding: %s", projectID)
 	}
 
 	onboardReqBody := map[string]any{
@@ -2110,7 +2215,20 @@ func performGeminiCLISetup(ctx context.Context, httpClient *http.Client, storage
 			finalProjectID := projectID
 			if responseProjectID != "" {
 				if explicitProject && !strings.EqualFold(responseProjectID, projectID) {
-					log.Warnf("Gemini onboarding returned project %s instead of requested %s; keeping requested project ID.", responseProjectID, projectID)
+					// Check if this is a free user (gen-lang-client projects or free/legacy tier)
+					isFreeUser := strings.HasPrefix(projectID, "gen-lang-client-") ||
+						strings.EqualFold(tierID, "FREE") ||
+						strings.EqualFold(tierID, "LEGACY")
+
+					if isFreeUser {
+						// For free users, use backend project ID for preview model access
+						log.Infof("Gemini onboarding: frontend project %s maps to backend project %s", projectID, responseProjectID)
+						log.Infof("Using backend project ID: %s (recommended for preview model access)", responseProjectID)
+						finalProjectID = responseProjectID
+					} else {
+						// Pro users: keep requested project ID (original behavior)
+						log.Warnf("Gemini onboarding returned project %s instead of requested %s; keeping requested project ID.", responseProjectID, projectID)
+					}
 				} else {
 					finalProjectID = responseProjectID
 				}

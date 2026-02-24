@@ -18,6 +18,7 @@ var providerAppliers = map[string]ProviderApplier{
 	"codex":       nil,
 	"iflow":       nil,
 	"antigravity": nil,
+	"kimi":        nil,
 }
 
 // GetProviderApplier returns the ProviderApplier for the given provider name.
@@ -63,6 +64,7 @@ func IsUserDefinedModel(modelInfo *registry.ModelInfo) bool {
 //   - model: Model name, optionally with thinking suffix (e.g., "claude-sonnet-4-5(16384)")
 //   - fromFormat: Source request format (e.g., openai, codex, gemini)
 //   - toFormat: Target provider format for the request body (gemini, gemini-cli, antigravity, claude, openai, codex, iflow)
+//   - providerKey: Provider identifier used for registry model lookups (may differ from toFormat, e.g., openrouter -> openai)
 //
 // Returns:
 //   - Modified request body JSON with thinking configuration applied
@@ -79,12 +81,16 @@ func IsUserDefinedModel(modelInfo *registry.ModelInfo) bool {
 // Example:
 //
 //	// With suffix - suffix config takes priority
-//	result, err := thinking.ApplyThinking(body, "gemini-2.5-pro(8192)", "gemini", "gemini")
+//	result, err := thinking.ApplyThinking(body, "gemini-2.5-pro(8192)", "gemini", "gemini", "gemini")
 //
 //	// Without suffix - uses body config
-//	result, err := thinking.ApplyThinking(body, "gemini-2.5-pro", "gemini", "gemini")
-func ApplyThinking(body []byte, model string, fromFormat string, toFormat string) ([]byte, error) {
+//	result, err := thinking.ApplyThinking(body, "gemini-2.5-pro", "gemini", "gemini", "gemini")
+func ApplyThinking(body []byte, model string, fromFormat string, toFormat string, providerKey string) ([]byte, error) {
 	providerFormat := strings.ToLower(strings.TrimSpace(toFormat))
+	providerKey = strings.ToLower(strings.TrimSpace(providerKey))
+	if providerKey == "" {
+		providerKey = providerFormat
+	}
 	fromFormat = strings.ToLower(strings.TrimSpace(fromFormat))
 	if fromFormat == "" {
 		fromFormat = providerFormat
@@ -102,7 +108,8 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	// 2. Parse suffix and get modelInfo
 	suffixResult := ParseSuffix(model)
 	baseModel := suffixResult.ModelName
-	modelInfo := registry.LookupModelInfo(baseModel)
+	// Use provider-specific lookup to handle capability differences across providers.
+	modelInfo := registry.LookupModelInfo(baseModel, providerKey)
 
 	// 3. Model capability check
 	// Unknown models are treated as user-defined so thinking config can still be applied.
@@ -320,6 +327,9 @@ func extractThinkingConfig(body []byte, provider string) ThinkingConfig {
 			return config
 		}
 		return extractOpenAIConfig(body)
+	case "kimi":
+		// Kimi uses OpenAI-compatible reasoning_effort format
+		return extractOpenAIConfig(body)
 	default:
 		return ThinkingConfig{}
 	}
@@ -382,7 +392,12 @@ func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
 	}
 
 	// Check thinkingLevel first (Gemini 3 format takes precedence)
-	if level := gjson.GetBytes(body, prefix+".thinkingLevel"); level.Exists() {
+	level := gjson.GetBytes(body, prefix+".thinkingLevel")
+	if !level.Exists() {
+		// Google official Gemini Python SDK sends snake_case field names
+		level = gjson.GetBytes(body, prefix+".thinking_level")
+	}
+	if level.Exists() {
 		value := level.String()
 		switch value {
 		case "none":
@@ -395,7 +410,12 @@ func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
 	}
 
 	// Check thinkingBudget (Gemini 2.5 format)
-	if budget := gjson.GetBytes(body, prefix+".thinkingBudget"); budget.Exists() {
+	budget := gjson.GetBytes(body, prefix+".thinkingBudget")
+	if !budget.Exists() {
+		// Google official Gemini Python SDK sends snake_case field names
+		budget = gjson.GetBytes(body, prefix+".thinking_budget")
+	}
+	if budget.Exists() {
 		value := int(budget.Int())
 		switch value {
 		case 0:

@@ -6,7 +6,6 @@
 package chat_completions
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -44,7 +43,7 @@ var (
 // Returns:
 //   - []byte: The transformed request data in Claude Code API format
 func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream bool) []byte {
-	rawJSON := bytes.Clone(inputRawJSON)
+	rawJSON := inputRawJSON
 
 	if account == "" {
 		u, _ := uuid.NewRandom()
@@ -110,10 +109,8 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	// Temperature setting for controlling response randomness
 	if temp := root.Get("temperature"); temp.Exists() {
 		out, _ = sjson.Set(out, "temperature", temp.Float())
-	}
-
-	// Top P setting for nucleus sampling
-	if topP := root.Get("top_p"); topP.Exists() {
+	} else if topP := root.Get("top_p"); topP.Exists() {
+		// Top P setting for nucleus sampling (filtered out if temperature is set)
 		out, _ = sjson.Set(out, "top_p", topP.Float())
 	}
 
